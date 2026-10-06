@@ -1,0 +1,241 @@
+From 7f4d8034c7a1fa460eabe48dc2c29d2277d9c777 Mon Sep 17 00:00:00 2001
+From: Fixture <fixture@example.com>
+Date: Mon, 5 Oct 2026 15:10:00 -0300
+Subject: [PATCH 3/3] Invite and revoke from the team settings screen
+
+The Pending invites section gains an invite form and a Revoke button
+per row, driven by team_invites.js against the invite API. New rows are
+built with textContent, so nothing from the API is parsed as HTML.
+---
+ app/screens/team_invites.py |  27 ++++++++--
+ app/screens/team_members.py |   3 +-
+ app/static/team_invites.js  | 105 ++++++++++++++++++++++++++++++++++++
+ tests/test_team_screen.py   |  25 +++++++++
+ 4 files changed, 156 insertions(+), 4 deletions(-)
+ create mode 100644 app/static/team_invites.js
+
+diff --git a/app/screens/team_invites.py b/app/screens/team_invites.py
+index f1af8a6..72b1de7 100644
+--- a/app/screens/team_invites.py
++++ b/app/screens/team_invites.py
+@@ -1,11 +1,16 @@
+-"""Settings > Team: the pending invites section.
++"""Settings > Team: pending invites, the invite form and the revoke button.
+ 
+ Not a page of its own. ``team_members.py`` renders it below the members table,
+-for admins only.
++for admins only. The behaviour is in ``app/static/team_invites.js``.
+ """
+ 
+ from html import escape
+ 
++from app.models import membership
++
++SCRIPT = "team_invites.js"
++DEFAULT_ROLE = "member"
++
+ 
+ def _row(invite):
+     return f"""
+@@ -14,9 +19,24 @@ def _row(invite):
+             <td>{escape(invite["role"].capitalize())}</td>
+             <td>{escape(invite["invited_by_name"] or "")}</td>
+             <td>{escape(invite["expires_at"][:10])}</td>
++            <td class="actions"><button type="button" class="js-revoke link-danger">Revoke</button></td>
+           </tr>"""
+ 
+ 
++def _form():
++    options = "".join(
++        f'<option value="{role}"{" selected" if role == DEFAULT_ROLE else ""}>'
++        f"{role.capitalize()}</option>"
++        for role in membership.ROLES
++    )
++    return f"""
++      <form class="js-invite-form inline-form">
++        <label>Email <input type="email" name="email" required autocomplete="off"></label>
++        <label>Role <select name="role">{options}</select></label>
++        <button type="submit">Send invite</button>
++      </form>"""
++
++
+ def render(team_id, invites):
+     rows = "".join(_row(invite) for invite in invites)
+     # Both the note and the table are always in the page, one of them hidden,
+@@ -26,10 +46,11 @@ def render(team_id, invites):
+       <header class="section-header">
+         <h2>Pending invites</h2>
+       </header>
++      <p class="error" role="alert" hidden></p>{_form()}
+       <p class="muted js-empty"{" hidden" if invites else ""}>No pending invites.</p>
+       <table class="data-table"{"" if invites else " hidden"}>
+         <thead>
+-          <tr><th>Email</th><th>Role</th><th>Invited by</th><th>Expires</th></tr>
++          <tr><th>Email</th><th>Role</th><th>Invited by</th><th>Expires</th><th></th></tr>
+         </thead>
+         <tbody>{rows}
+         </tbody>
+diff --git a/app/screens/team_members.py b/app/screens/team_members.py
+index 110d52f..5a4fbeb 100644
+--- a/app/screens/team_members.py
++++ b/app/screens/team_members.py
+@@ -55,7 +55,8 @@ def render(team_id, members, viewer, invites=()):
+         </tbody>
+       </table>
+     </section>{invites_section}"""
+-    return page("Team settings", body, scripts=("team_members.js",) if can_manage else ())
++    scripts = ("team_members.js", team_invites.SCRIPT) if can_manage else ()
++    return page("Team settings", body, scripts=scripts)
+ 
+ 
+ @require_team_role()
+diff --git a/app/static/team_invites.js b/app/static/team_invites.js
+new file mode 100644
+index 0000000..a9c3af0
+--- /dev/null
++++ b/app/static/team_invites.js
+@@ -0,0 +1,105 @@
++// Settings > Team: invite someone by email and revoke pending invites, without a page reload.
++(function () {
++  const section = document.getElementById("team-invites");
++  if (!section) return;
++
++  const teamId = section.dataset.teamId;
++  const errorBox = section.querySelector(".error");
++  const form = section.querySelector(".js-invite-form");
++  const table = section.querySelector("table");
++  const emptyNote = section.querySelector(".js-empty");
++
++  function showError(message) {
++    errorBox.textContent = message;
++    errorBox.hidden = false;
++  }
++
++  function clearError() {
++    errorBox.hidden = true;
++    errorBox.textContent = "";
++  }
++
++  // Resolves to { data } when the request worked and { problem } when it did not.
++  async function send(method, path, body) {
++    const response = await fetch(`/api/teams/${teamId}/invites${path}`, {
++      method,
++      headers: body ? { "Content-Type": "application/json" } : {},
++      body: body ? JSON.stringify(body) : undefined,
++    });
++    const data = await response.json().catch(() => ({}));
++    if (response.ok) return { data };
++    return { problem: data.error || "Something went wrong. Try again." };
++  }
++
++  function refreshEmptyState() {
++    const empty = table.tBodies[0].rows.length === 0;
++    table.hidden = empty;
++    emptyNote.hidden = !empty;
++  }
++
++  function capitalize(text) {
++    return text.charAt(0).toUpperCase() + text.slice(1);
++  }
++
++  // Mirrors _row in app/screens/team_invites.py. Every value goes in through
++  // textContent or dataset, so nothing from the API is parsed as HTML.
++  function buildRow(invite) {
++    const row = document.createElement("tr");
++    row.dataset.inviteId = invite.id;
++    row.dataset.inviteEmail = invite.email;
++    const cells = [
++      invite.email,
++      capitalize(invite.role),
++      invite.invited_by || "",
++      invite.expires_at.slice(0, 10),
++    ];
++    for (const text of cells) {
++      row.insertCell().textContent = text;
++    }
++    const button = document.createElement("button");
++    button.type = "button";
++    button.className = "js-revoke link-danger";
++    button.textContent = "Revoke";
++    const actions = row.insertCell();
++    actions.className = "actions";
++    actions.append(button);
++    return row;
++  }
++
++  form.addEventListener("submit", async (event) => {
++    event.preventDefault();
++    clearError();
++    const submit = form.querySelector('button[type="submit"]');
++    submit.disabled = true;
++    const { data, problem } = await send("POST", "", {
++      email: form.elements.email.value,
++      role: form.elements.role.value,
++    });
++    submit.disabled = false;
++    if (problem) {
++      showError(problem);
++      return;
++    }
++    table.tBodies[0].prepend(buildRow(data.invite));
++    refreshEmptyState();
++    form.reset();
++    form.elements.email.focus();
++  });
++
++  section.addEventListener("click", async (event) => {
++    const button = event.target.closest(".js-revoke");
++    if (!button) return;
++    const row = button.closest("tr");
++    if (!window.confirm(`Revoke the invite for ${row.dataset.inviteEmail}?`)) return;
++    clearError();
++    button.disabled = true;
++    const { problem } = await send("DELETE", `/${row.dataset.inviteId}`);
++    if (problem) {
++      button.disabled = false;
++      showError(problem);
++    } else {
++      row.remove();
++      refreshEmptyState();
++    }
++  });
++})();
+diff --git a/tests/test_team_screen.py b/tests/test_team_screen.py
+index 2385bc0..49f720b 100644
+--- a/tests/test_team_screen.py
++++ b/tests/test_team_screen.py
+@@ -80,6 +80,31 @@ class PendingInvitesSectionTest(unittest.TestCase):
+         self.assertNotIn("<b>", html)
+         self.assertIn("&lt;b&gt;&quot;x&quot;@example.com", html)
+ 
++    def test_admin_gets_the_invite_form(self):
++        html = self.screen()
++        self.assertIn('<form class="js-invite-form', html)
++        self.assertIn('<input type="email" name="email" required', html)
++        self.assertIn('<option value="member" selected>Member</option>', html)
++        for role in ("admin", "viewer"):
++            self.assertIn(f'<option value="{role}">{role.capitalize()}</option>', html)
++        self.assertIn("Send invite</button>", html)
++
++    def test_each_invite_has_a_revoke_button(self):
++        self.invite("one@example.com")
++        self.invite("two@example.com")
++        self.assertEqual(self.screen().count('class="js-revoke link-danger">Revoke</button>'), 2)
++
++    def test_admin_page_loads_both_scripts(self):
++        html = self.screen()
++        self.assertIn('<script src="/static/team_members.js" defer></script>', html)
++        self.assertIn('<script src="/static/team_invites.js" defer></script>', html)
++
++    def test_member_page_has_no_invite_controls(self):
++        self.invite()
++        html = self.screen(BO)
++        for marker in ("js-invite-form", "js-revoke", "team_invites.js"):
++            self.assertNotIn(marker, html)
++
+     def test_token_is_not_in_the_page(self):
+         row = self.invite()
+         self.assertNotIn(row["token"], self.screen())
+-- 
+2.55.0
+

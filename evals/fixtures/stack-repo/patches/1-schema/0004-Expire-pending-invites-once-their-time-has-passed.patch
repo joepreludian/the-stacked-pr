@@ -1,0 +1,119 @@
+From 1099dda2f4bc4865cfae35605b3d534317805c35 Mon Sep 17 00:00:00 2001
+From: Fixture <fixture@example.com>
+Date: Thu, 1 Oct 2026 17:05:00 -0300
+Subject: [PATCH 4/4] Expire pending invites once their time has passed
+
+Status is stored, so something has to flip it. expire_overdue does it in
+one UPDATE and every read in the model runs it first, which avoids both
+a scheduled job and callers seeing a stale pending invite.
+---
+ app/models/invite.py       | 17 +++++++++++++++
+ tests/test_invite_model.py | 44 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/app/models/invite.py b/app/models/invite.py
+index 897dad9..20baa68 100644
+--- a/app/models/invite.py
++++ b/app/models/invite.py
+@@ -39,8 +39,23 @@ def normalize_email(email):
+     return email.strip().lower()
+ 
+ 
++def expire_overdue(conn):
++    """Mark pending invites whose time has run out as expired. Returns how many.
++
++    Every read below runs this first, so callers never see a stale ``pending``
++    and no scheduled job is needed.
++    """
++    cursor = conn.execute(
++        "UPDATE invites SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?",
++        (_stamp(_now()),),
++    )
++    conn.commit()
++    return cursor.rowcount
++
++
+ def list_for_team(conn, team_id, status=None):
+     """A team's invites, newest first, optionally only those with one status."""
++    expire_overdue(conn)
+     sql, args = _SELECT + " WHERE i.team_id = ?", [team_id]
+     if status is not None:
+         sql += " AND i.status = ?"
+@@ -50,6 +65,7 @@ def list_for_team(conn, team_id, status=None):
+ 
+ 
+ def find(conn, team_id, invite_id):
++    expire_overdue(conn)
+     row = conn.execute(
+         _SELECT + " WHERE i.team_id = ? AND i.id = ?", (team_id, invite_id)
+     ).fetchone()
+@@ -57,6 +73,7 @@ def find(conn, team_id, invite_id):
+ 
+ 
+ def find_pending_for_email(conn, team_id, email):
++    expire_overdue(conn)
+     row = conn.execute(
+         _SELECT + " WHERE i.team_id = ? AND i.email = ? AND i.status = 'pending'",
+         (team_id, normalize_email(email)),
+diff --git a/tests/test_invite_model.py b/tests/test_invite_model.py
+index 52ca05e..5b55af9 100644
+--- a/tests/test_invite_model.py
++++ b/tests/test_invite_model.py
+@@ -1,5 +1,5 @@
+ import unittest
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ from unittest import mock
+ 
+ from app.models import invite
+@@ -101,5 +101,47 @@ class RevokeInviteTest(InviteModelCase):
+         self.assertNotEqual(again["id"], row["id"])
+ 
+ 
++class ExpiryTest(InviteModelCase):
++    def setUp(self):
++        super().setUp()
++        with mock.patch.object(invite, "_now", return_value=NOON):
++            self.row = self.invite()
++
++    def at(self, **after_creation):
++        return mock.patch.object(invite, "_now", return_value=NOON + timedelta(**after_creation))
++
++    def test_invite_stays_pending_until_its_expiry(self):
++        with self.at(days=invite.TTL_DAYS, seconds=-1):
++            self.assertEqual(invite.expire_overdue(self.conn), 0)
++            self.assertEqual(invite.find(self.conn, TEAM, self.row["id"])["status"], "pending")
++
++    def test_overdue_invite_reads_as_expired(self):
++        with self.at(days=invite.TTL_DAYS):
++            self.assertEqual(invite.find(self.conn, TEAM, self.row["id"])["status"], "expired")
++            self.assertEqual(invite.list_for_team(self.conn, TEAM, status="pending"), [])
++
++    def test_expire_overdue_reports_how_many_changed(self):
++        with self.at(days=1):
++            self.invite("later@example.com")
++        with self.at(days=invite.TTL_DAYS):
++            self.assertEqual(invite.expire_overdue(self.conn), 1)
++            self.assertEqual(invite.expire_overdue(self.conn), 0)
++
++    def test_revoked_invite_is_not_expired(self):
++        invite.revoke(self.conn, TEAM, self.row["id"])
++        with self.at(days=30):
++            self.assertEqual(invite.find(self.conn, TEAM, self.row["id"])["status"], "revoked")
++
++    def test_expired_invite_cannot_be_revoked(self):
++        with self.at(days=30):
++            with self.assertRaises(invite.NotPendingError):
++                invite.revoke(self.conn, TEAM, self.row["id"])
++
++    def test_address_can_be_invited_again_once_expired(self):
++        with self.at(days=30):
++            again = self.invite(self.row["email"])
++        self.assertEqual(again["status"], "pending")
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.55.0
+

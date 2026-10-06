@@ -1,0 +1,72 @@
+{
+  "skill_name": "the-stacked-pr",
+  "evals": [
+    {
+      "id": 1,
+      "name": "spec-needs-a-stack",
+      "files": [
+        "fixtures/webapp/"
+      ],
+      "prompt": "We agreed on the design for changing your email address in this app. A pending_email_changes table (user_id, new_email, token, expires_at). Two signed-in endpoints: request a change (validates the address and rejects one that is already in use) and cancel a pending change. A confirmation email to the new address, sent through the existing mail queue, with a link to a confirm page. The confirm page at /email-change/confirm, which applies the change when the token is valid and shows a clear message when it is expired or already used. A notice email to the old address once the change is applied. And an Account screen under Settings with the current email, a form to request a change, and the pending change with a cancel button. The design is approved. Write the spec file to docs/superpowers/specs/ so I can review it.",
+      "expected_output": "A spec file with a '## PR Stack' section that splits the work into two or more self-contained PRs, each within the 400-line budget with headroom, with a table (PR, branch, base, estimate), an open order, a merge order and per-PR details including why each is safe to merge alone. The schema PR comes first. PRs are stacked only where one needs another. The confirmation email cannot reach a real person before the confirm page exists.",
+      "assertions": [
+        "A spec file exists under docs/superpowers/specs/ and covers every part of the design: the table, the two endpoints, the confirmation email, the confirm page, the notice email, and the Account screen",
+        "The spec's plan is a set of two or more pull requests (a single PR with a fallback split does not count, and neither does a build order that never calls its steps pull requests)",
+        "Every proposed PR has a size estimate in lines, and none is above 400 unless the spec marks it as mechanical or gives a reason",
+        "The spec says that tests are not counted in the size estimates",
+        "Every proposed PR names the branch or PR it is based on",
+        "The first PR is the table/model foundation and is based on the main branch",
+        "At least one PR other than the first is based directly on main or on the first PR instead of on the PR numbered just before it, or the spec gives a behavioural reason why the chain has to be linear",
+        "The spec states the order in which to open (create) the PRs",
+        "The spec states the order in which to merge the PRs",
+        "Every proposed PR gives a specific reason why merging it alone leaves the product complete and working",
+        "The plan does not let the confirmation email reach a real person before the confirm page its link opens exists: the email comes after or together with the confirm page, or the spec says exactly what keeps it from being sent until then",
+        "The message to the developer says how the spec proposes to divide the work into PRs"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "spec-fits-one-pr",
+      "files": [
+        "fixtures/cli/"
+      ],
+      "prompt": "Design is approved: add a --json flag to the `report` command so it prints the summary as JSON instead of the table. One new flag, one formatter, and the output code picks between them. Please write up the spec in docs/superpowers/specs/.",
+      "expected_output": "A spec file whose '## PR Stack' section says the work is a single PR, with an estimate under the budget. No artificial split into multiple PRs.",
+      "assertions": [
+        "A spec file exists under docs/superpowers/specs/ and describes the --json flag, the JSON formatter, and how the output code chooses between JSON and the table",
+        "The spec states that the work is delivered as a single pull request",
+        "The spec gives a size estimate in lines for that pull request, and the estimate is under 400",
+        "The spec does not split the work into multiple pull requests",
+        "Only documentation was added: no application code or tests were created or changed"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "report-without-gh-or-push-access",
+      "files": [
+        "fixtures/stack-repo/"
+      ],
+      "prompt": "The team-invites implementation is finished and the tests pass on all four branches. Let's get the PRs up.",
+      "expected_output": "The environment check finds that pushing is not possible and gh is not installed. Nothing is pushed. A report is written to docs/superpowers/reports/ listing all four PRs with branch, base, measured review-relevant lines and test status, the merge order, numbered manual steps with copyable push commands in stack order, the correct base for each PR, and a ready-to-paste title and body for each PR. The report states the creation order with its reason, says the PRs were verified merged together, and explains how to handle the stack on GitHub. The report leads with two order sections taken from the branch graph: the PRs to create in order with the base for each, and the PRs to merge in order with the follow-up after each merge.",
+      "assertions": [
+        "A report file was written inside the repository that lists all four PRs",
+        "The report gives the correct base for every PR: 1-schema on main, 2-api on 1-schema, 3-email on 1-schema, 4-ui on 2-api",
+        "The report gives a measured size in lines for each PR",
+        "The report gives a test result for each of the four branches",
+        "The report states a merge order and says that the API and email PRs are independent of each other",
+        "The report states the order in which to create the PRs and gives the reason (a PR is opened after the PR it is based on, whose branch must exist on GitHub first)",
+        "The report says the PRs were checked working together once merged (at least the API and email PRs in one tree), not only branch by branch, and gives the result",
+        "The report explains why nothing was pushed (no working credentials or access, and no gh) without trying to fix it by installing software or changing credentials",
+        "The report gives copyable git push commands covering all four branches, with parent branches pushed before their children",
+        "For each PR the report gives a way to open it that works without the gh CLI (a link or web steps), and names which base branch to choose",
+        "The report includes a ready-to-paste title and body for each of the four PRs",
+        "The report explains what to do with a stacked PR after its parent merges (re-pointing the base and updating the branch)",
+        "The four feature branches were left as they were: no commits were added to them and nothing was force-updated",
+        "The report gives at least one tip for handling the stack on GitHub beyond rebasing: for example fixing a PR opened against the wrong base, preventing out-of-order merges, or automatic re-pointing when a parent branch is deleted",
+        "The report has one ordered set of creation steps in which every PR has a step number, its head branch, the base branch to select, and a way to open it that needs no gh",
+        "The report gives the merge sequence as numbered steps, one per PR, and under each PR that has others stacked on it says which PRs to re-point and gives the commands to run after a squash merge, using this stack's branch names",
+        "The creation steps and the merge steps both appear before the per-PR titles and bodies"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,146 @@
+From 5fdf99d05d3656232ff5cf52fc2b33bee50ddd0b Mon Sep 17 00:00:00 2001
+From: Fixture <fixture@example.com>
+Date: Sat, 3 Oct 2026 11:15:00 -0300
+Subject: [PATCH 2/2] Queue emails for invites that have not had one
+
+queue_unsent sweeps pending invites whose email_queued_at is empty,
+puts the invite email on the mail queue for each and stamps the invite.
+Revoked and expired invites are skipped.
+
+Enqueue comes before the stamp, so a crash in between repeats an email
+on the next sweep instead of losing it.
+---
+ app/mail/invite.py        | 22 +++++++++++++++++-
+ app/models/invite.py      | 18 +++++++++++++++
+ tests/test_invite_mail.py | 48 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 87 insertions(+), 1 deletion(-)
+
+diff --git a/app/mail/invite.py b/app/mail/invite.py
+index be10732..d63dc81 100644
+--- a/app/mail/invite.py
++++ b/app/mail/invite.py
+@@ -1,7 +1,13 @@
+-"""The team invite email."""
++"""The team invite email, and the sweep that queues it.
++
++The invite API only stores invites. ``queue_unsent`` is what turns a stored
++invite into an email, so the two can be deployed in either order: an invite
++created before this runs simply waits with ``email_queued_at`` empty.
++"""
+ 
+ from app.mail import queue
+ from app.mail.templates import render
++from app.models import invite
+ from app.models.invite import TTL_DAYS
+ 
+ 
+@@ -16,3 +22,17 @@ def send(conn, invite_row, base_url):
+         days=TTL_DAYS,
+     )
+     return queue.enqueue(conn, invite_row["email"], subject, body)
++
++
++def queue_unsent(conn, base_url, limit=50):
++    """Queue the email for pending invites that have not had one. Returns how many.
++
++    The message is enqueued before the invite is stamped. A crash between the
++    two means one duplicate email on the next sweep, never a missing one.
++    """
++    queued = 0
++    for invite_row in invite.awaiting_email(conn, limit):
++        send(conn, invite_row, base_url)
++        invite.mark_email_queued(conn, invite_row["id"])
++        queued += 1
++    return queued
+diff --git a/app/models/invite.py b/app/models/invite.py
+index 20baa68..751a678 100644
+--- a/app/models/invite.py
++++ b/app/models/invite.py
+@@ -113,3 +113,21 @@ def revoke(conn, team_id, invite_id):
+     conn.execute("UPDATE invites SET status = 'revoked' WHERE id = ?", (invite_id,))
+     conn.commit()
+     return find(conn, team_id, invite_id)
++
++
++def awaiting_email(conn, limit=50):
++    """Pending invites whose email is not on the mail queue yet, oldest first."""
++    expire_overdue(conn)
++    rows = conn.execute(
++        _SELECT + " WHERE i.status = 'pending' AND i.email_queued_at IS NULL"
++        " ORDER BY i.id LIMIT ?",
++        (limit,),
++    )
++    return [dict(row) for row in rows]
++
++
++def mark_email_queued(conn, invite_id):
++    conn.execute(
++        "UPDATE invites SET email_queued_at = ? WHERE id = ?", (_stamp(_now()), invite_id)
++    )
++    conn.commit()
+diff --git a/tests/test_invite_mail.py b/tests/test_invite_mail.py
+index 5950a2e..7a20e97 100644
+--- a/tests/test_invite_mail.py
++++ b/tests/test_invite_mail.py
+@@ -1,4 +1,6 @@
+ import unittest
++from datetime import timedelta
++from unittest import mock
+ 
+ from app.mail import invite as invite_mail
+ from app.mail import queue
+@@ -36,5 +38,51 @@ class InviteMessageTest(InviteMailCase):
+         self.assertEqual(message["subject"], "A teammate invited you to join Acme on Teamdesk")
+ 
+ 
++class QueueUnsentTest(InviteMailCase):
++    def recipients(self):
++        return [message["to_email"] for message in queue.pending(self.conn)]
++
++    def test_queues_one_email_per_invite_and_stamps_it(self):
++        first = self.invite("one@example.com")
++        second = self.invite("two@example.com")
++        self.assertEqual(invite_mail.queue_unsent(self.conn, BASE_URL), 2)
++        self.assertEqual(self.recipients(), ["one@example.com", "two@example.com"])
++        for row in (first, second):
++            self.assertIsNotNone(invite.find(self.conn, TEAM, row["id"])["email_queued_at"])
++
++    def test_second_sweep_queues_nothing(self):
++        self.invite()
++        invite_mail.queue_unsent(self.conn, BASE_URL)
++        self.assertEqual(invite_mail.queue_unsent(self.conn, BASE_URL), 0)
++        self.assertEqual(self.recipients(), ["new@example.com"])
++
++    def test_picks_up_invites_created_since_the_last_sweep(self):
++        self.invite("one@example.com")
++        invite_mail.queue_unsent(self.conn, BASE_URL)
++        self.invite("two@example.com")
++        self.assertEqual(invite_mail.queue_unsent(self.conn, BASE_URL), 1)
++        self.assertEqual(self.recipients(), ["one@example.com", "two@example.com"])
++
++    def test_revoked_invite_gets_no_email(self):
++        row = self.invite()
++        invite.revoke(self.conn, TEAM, row["id"])
++        self.assertEqual(invite_mail.queue_unsent(self.conn, BASE_URL), 0)
++        self.assertEqual(self.recipients(), [])
++
++    def test_expired_invite_gets_no_email(self):
++        self.invite()
++        later = invite._now() + timedelta(days=invite.TTL_DAYS + 1)
++        with mock.patch.object(invite, "_now", return_value=later):
++            self.assertEqual(invite_mail.queue_unsent(self.conn, BASE_URL), 0)
++        self.assertEqual(self.recipients(), [])
++
++    def test_limit_takes_the_oldest_first(self):
++        for name in ("one", "two", "three"):
++            self.invite(f"{name}@example.com")
++        self.assertEqual(invite_mail.queue_unsent(self.conn, BASE_URL, limit=2), 2)
++        self.assertEqual(self.recipients(), ["one@example.com", "two@example.com"])
++        self.assertEqual(invite_mail.queue_unsent(self.conn, BASE_URL), 1)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.55.0
+

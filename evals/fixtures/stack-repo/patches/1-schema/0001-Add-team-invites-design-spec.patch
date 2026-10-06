@@ -1,0 +1,216 @@
+From ff81fde3ab219470ad52e1e7af1e306845d545e0 Mon Sep 17 00:00:00 2001
+From: Fixture <fixture@example.com>
+Date: Thu, 1 Oct 2026 10:12:00 -0300
+Subject: [PATCH 1/4] Add team invites design spec
+
+Covers the invites table, the admin API, email delivery through a sweep
+over the mail queue, and the Settings > Team screen. Includes the PR
+stack the work will be delivered in.
+---
+ .../specs/2026-10-01-team-invites-design.md   | 194 ++++++++++++++++++
+ 1 file changed, 194 insertions(+)
+ create mode 100644 docs/superpowers/specs/2026-10-01-team-invites-design.md
+
+diff --git a/docs/superpowers/specs/2026-10-01-team-invites-design.md b/docs/superpowers/specs/2026-10-01-team-invites-design.md
+new file mode 100644
+index 0000000..f99e303
+--- /dev/null
++++ b/docs/superpowers/specs/2026-10-01-team-invites-design.md
+@@ -0,0 +1,194 @@
++# Team invites — design
++
++Date: 2026-10-01
++Status: approved
++
++## Goal
++
++A team admin can invite someone to the team by email, choosing the role they
++will get. Admins can see the invites that are still waiting and revoke one.
++The invited person receives an email with a link.
++
++Today the only way onto a team is a row inserted by hand, so every new
++teammate is a support request.
++
++## Out of scope
++
++- **Accepting an invite.** The email links to `/invites/accept?token=...`,
++  which does not exist yet. Accepting (sign-up, joining the team, marking the
++  invite `accepted`) is its own spec. The `accepted` status is in the schema
++  now so that spec needs no migration.
++- Resending an invite, and invite history (revoked and expired invites are
++  kept in the table but not shown).
++- Rate limiting and bulk invites.
++- Pointing the mail worker at the new sweep. The worker that already calls
++  `queue.deliver_pending` runs outside this repository; it gains one call,
++  as a deployment follow-up.
++
++## Design
++
++### Data
++
++Migration `005_invites.sql` adds one table:
++
++| Column | Notes |
++|---|---|
++| `id` | primary key |
++| `team_id` | references `teams`, cascade on delete |
++| `email` | stored trimmed and lower-cased |
++| `role` | same three values as `memberships.role` |
++| `token` | unique, `secrets.token_urlsafe(32)`, as password resets do |
++| `status` | `pending`, `accepted`, `revoked` or `expired`; default `pending` |
++| `invited_by` | references `users`, set null on delete |
++| `expires_at` | UTC ISO timestamp, 7 days after creation |
++| `email_queued_at` | nullable; set when the invite email is put on the mail queue |
++| `created_at` | default now |
++
++A partial unique index on `(team_id, email) WHERE status = 'pending'` makes
++"one pending invite per address per team" a database guarantee and not only a
++check in Python.
++
++`app/models/invite.py` follows `app/models/membership.py`: `create`,
++`list_for_team`, `find`, `find_pending_for_email`, `revoke`.
++
++**Expiry.** Status is stored, not computed. `expire_overdue(conn)` flips every
++pending invite whose `expires_at` has passed to `expired`, and each read in
++the model runs it first, so callers never see a stale `pending`. It is one
++indexed `UPDATE`; no scheduled job is needed. Timestamps are written with
++second precision so they compare correctly as text.
++
++### API
++
++`app/handlers/invites.py`, all three endpoints admin only through
++`require_team_role("admin")`:
++
++| Method and path | Result |
++|---|---|
++| `POST /api/teams/<team_id>/invites` with `{"email", "role"}` | `201` and the invite |
++| `GET /api/teams/<team_id>/invites` | `200` and the pending invites, newest first |
++| `DELETE /api/teams/<team_id>/invites/<invite_id>` | `204` |
++
++Validation on create:
++
++- email does not look like an address: `422`
++- role is not one of `membership.ROLES`: `422`
++- the address belongs to someone already on the team: `409`
++- the address already has a pending invite to the team: `409`
++
++Revoke answers `404` for an unknown invite and `409` for one that is no longer
++pending. The token never appears in an API response: it is the invited
++person's credential, not the admin's.
++
++The membership check needs a lookup by email, so `app/models/membership.py`
++gains `find_for_email`.
++
++**The API does not send email.** It only inserts the row. See the next
++section.
++
++### Email
++
++The README rule is that nothing sends mail inside a request, and password
++resets already stretch it by enqueueing in the handler. Invites go one step
++further and keep the handler out of mail entirely:
++
++- `app/mail/invite.py` has `queue_unsent(conn, base_url)`. It finds pending
++  invites whose `email_queued_at` is null, puts the invite email on the
++  existing mail queue for each, and stamps `email_queued_at`.
++- The model gains the two functions the sweep needs: `awaiting_email` and
++  `mark_email_queued`.
++- The template is `app/mail/templates/invite.txt`, in the same format as
++  `password_reset.txt`.
++
++This is what lets the API and the email be built and reviewed separately: the
++only thing they share is the table. An invite created before the email code
++is deployed simply waits with `email_queued_at` null and is picked up by the
++first sweep.
++
++The message is enqueued before the invite is stamped. A crash between the two
++means one duplicate email on the next sweep, which is better than an invite
++that never gets one.
++
++### Screen
++
++Settings > Team gains a "Pending invites" section below the members table,
++for admins only (members and viewers see the page exactly as today):
++
++- a form with an email field, a role select and a "Send invite" button
++- a table of pending invites: email, role, who invited, expiry date, and a
++  "Revoke" button per row
++- an empty state when there are none
++
++The section is its own module, `app/screens/team_invites.py`, rendered by
++`app/screens/team_members.py`, with its behaviour in
++`app/static/team_invites.js`: submit the form to the create endpoint and add
++the row, revoke with a confirmation and remove the row, show API errors in
++the section's alert. `layout.page` currently takes a single script; it
++changes to take several.
++
++## Testing
++
++`unittest`, in the style of the existing suites and using `tests/helpers.py`:
++
++- model: create, duplicate pending, list order and status filter, revoke,
++  expiry (by patching the model's clock)
++- API: each endpoint's happy path, permissions, and every validation rule
++- email: the rendered message, the sweep stamping invites, and a second sweep
++  queueing nothing
++- screen: the rendered HTML for an admin, for a member, and with no invites
++
++The JavaScript has no test harness in this project, as with
++`team_members.js`; it is checked by hand.
++
++## PR Stack
++
++Budget: about 400 review-relevant lines per PR. Tests, lockfiles, generated files and docs are not counted.
++Estimated total: about 550 lines, split into 4 PRs.
++
++| # | PR | Branch | Based on | Est. lines |
++|---|----|--------|----------|-----------|
++| 1 | Add invites table and model | `team-invites/1-schema` | `main` | ~150 |
++| 2 | Invite API endpoints | `team-invites/2-api` | PR 1 | ~100 |
++| 3 | Invite email delivery | `team-invites/3-email` | PR 1 | ~100 |
++| 4 | Invite management screen | `team-invites/4-ui` | PR 2 | ~200 |
++
++Merge order: 1, then 2 and 3 in either order, then 4.
++
++Estimates are anchored on the closest existing code: the memberships model
++and migration (88 lines) for PR 1, with a token, a status and expiry on top;
++the memberships handler (64 lines) for PR 2, with more validation; the
++password reset mail module (15 lines) plus a sweep and two model functions
++for PR 3; the team screen and its script (128 lines) for PR 4, which adds a
++form and builds rows in the browser.
++
++The total would fit in two PRs by size. It is four because the slices are
++read for different things (schema, permissions and validation, delivery
++semantics and wording, markup and browser code), and because PR 2 and PR 3
++do not depend on each other and can be reviewed in parallel.
++
++### PR 1 — Add invites table and model
++- **Delivers:** the `invites` table and `app/models/invite.py` with create, list, find, revoke and expiry. Also carries this spec and the plan.
++- **Touches:** `migrations/005_invites.sql`, `app/models/invite.py`, `tests/test_invite_model.py`, `docs/superpowers/`
++- **Reviewer focus:** the partial unique index for pending invites, and expiring on read instead of with a scheduled job.
++- **Verify:** `python3 -m unittest tests.test_invite_model`, then the full suite.
++- **Safe alone because:** nothing calls the model yet; the migration only adds a table.
++
++### PR 2 — Invite API endpoints
++- **Delivers:** admins can create, list and revoke invites over the JSON API.
++- **Touches:** `app/handlers/invites.py`, `app/server.py`, `app/models/membership.py` (`find_for_email`), `tests/test_invites_api.py`, `tests/test_memberships.py`
++- **Reviewer focus:** the validation order and status codes on create, and that the token is never returned.
++- **Verify:** `python3 -m unittest tests.test_invites_api`, then the full suite.
++- **Safe alone because:** creating an invite only inserts a row. Without PR 3 no email goes out, and without PR 4 nothing in the product calls the endpoints.
++
++### PR 3 — Invite email delivery
++- **Delivers:** `queue_unsent` puts an invite email on the mail queue for every pending invite that has not had one.
++- **Touches:** `app/mail/invite.py`, `app/mail/templates/invite.txt`, `app/models/invite.py` (`awaiting_email`, `mark_email_queued`), `tests/test_invite_mail.py`
++- **Reviewer focus:** enqueue-then-stamp ordering (a crash can duplicate an email, never lose one), and the wording of the email.
++- **Verify:** `python3 -m unittest tests.test_invite_mail`, then the full suite.
++- **Safe alone because:** with no invites in the table the sweep does nothing, and nothing calls it until the worker is pointed at it.
++
++### PR 4 — Invite management screen
++- **Delivers:** the "Pending invites" section on Settings > Team, with the invite form and revoke button, for admins.
++- **Touches:** `app/screens/team_invites.py`, `app/screens/team_members.py`, `app/screens/layout.py`, `app/static/team_invites.js`, `tests/test_team_screen.py`
++- **Reviewer focus:** HTML escaping of invite data on the server, and that the script builds rows with `textContent`, never `innerHTML`.
++- **Verify:** `python3 -m unittest tests.test_team_screen`, then the full suite; by hand, invite and revoke as an admin and load the page as a member.
++- **Safe alone because:** members and viewers see the page exactly as before, and every control in the new section calls an endpoint PR 2 already shipped. It does not need PR 3: invites made from the screen get their email whenever the sweep lands.
+-- 
+2.55.0
+

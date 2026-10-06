@@ -1,0 +1,187 @@
+From b2e4d868ae8157fd237e5ffde383df234e4c0230 Mon Sep 17 00:00:00 2001
+From: Fixture <fixture@example.com>
+Date: Fri, 2 Oct 2026 11:30:00 -0300
+Subject: [PATCH 2/3] Add invite list and revoke endpoints
+
+GET and DELETE under /api/teams/<team_id>/invites, admins only. The
+list returns pending invites; the token is left out of every response.
+---
+ app/handlers/invites.py   | 47 ++++++++++++++++++++
+ app/server.py             |  3 +-
+ tests/test_invites_api.py | 90 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 139 insertions(+), 1 deletion(-)
+ create mode 100644 app/handlers/invites.py
+ create mode 100644 tests/test_invites_api.py
+
+diff --git a/app/handlers/invites.py b/app/handlers/invites.py
+new file mode 100644
+index 0000000..d39e06e
+--- /dev/null
++++ b/app/handlers/invites.py
+@@ -0,0 +1,47 @@
++"""JSON API for a team's invites. Admins only.
++
++Creating an invite only stores it. The email is queued later by the sweep in
++``app/mail``, so nothing here touches the mail queue.
++"""
++
++from app.auth import require_team_role
++from app.http import error, json_response, no_content
++from app.models import invite
++
++
++def _public(row):
++    # The token is the invited person's credential. It never leaves in a response.
++    return {
++        "id": row["id"],
++        "email": row["email"],
++        "role": row["role"],
++        "status": row["status"],
++        "invited_by": row["invited_by_name"],
++        "created_at": row["created_at"],
++        "expires_at": row["expires_at"],
++    }
++
++
++@require_team_role("admin")
++def list_invites(request):
++    rows = invite.list_for_team(request.conn, request.team_id, status="pending")
++    return json_response({"invites": [_public(row) for row in rows]})
++
++
++@require_team_role("admin")
++def revoke_invite(request):
++    raw = request.params.get("invite_id", "")
++    if not raw.isdigit():
++        return error(404, "Invite not found")
++    try:
++        revoked = invite.revoke(request.conn, request.team_id, int(raw))
++    except invite.NotPendingError:
++        return error(409, "Only a pending invite can be revoked")
++    if revoked is None:
++        return error(404, "Invite not found")
++    return no_content()
++
++
++def register(router):
++    router.add("GET", "/api/teams/<team_id>/invites", list_invites)
++    router.add("DELETE", "/api/teams/<team_id>/invites/<invite_id>", revoke_invite)
+diff --git a/app/server.py b/app/server.py
+index e11165e..cbb64fe 100644
+--- a/app/server.py
++++ b/app/server.py
+@@ -1,6 +1,6 @@
+ """The WSGI application."""
+ 
+-from app.handlers import memberships, password_resets
++from app.handlers import invites, memberships, password_resets
+ from app.http import Request, Router
+ from app.screens import team_members
+ 
+@@ -14,6 +14,7 @@ STATUS_TEXT = {
+ def build_router():
+     router = Router()
+     memberships.register(router)
++    invites.register(router)
+     password_resets.register(router)
+     team_members.register(router)
+     return router
+diff --git a/tests/test_invites_api.py b/tests/test_invites_api.py
+new file mode 100644
+index 0000000..47ca47c
+--- /dev/null
++++ b/tests/test_invites_api.py
+@@ -0,0 +1,90 @@
++import unittest
++
++from app.models import invite
++from tests.helpers import ADA, BO, CY, DEE, TEAM, call, make_env
++
++INVITES = f"/api/teams/{TEAM}/invites"
++OTHER_TEAM = 2
++
++
++class InvitesApiCase(unittest.TestCase):
++    def setUp(self):
++        self.conn, self.app = make_env()
++
++    def invite(self, email="new@example.com", role="member", team_id=TEAM):
++        return invite.create(self.conn, team_id, email, role, ADA)
++
++
++class ListInvitesTest(InvitesApiCase):
++    def test_admin_lists_pending_invites_newest_first(self):
++        self.invite("one@example.com", "viewer")
++        self.invite("two@example.com")
++        status, body = call(self.app, "GET", INVITES, user_id=ADA)
++        self.assertEqual(status, 200)
++        self.assertEqual([i["email"] for i in body["invites"]], ["two@example.com", "one@example.com"])
++        self.assertEqual(
++            sorted(body["invites"][1]),
++            ["created_at", "email", "expires_at", "id", "invited_by", "role", "status"],
++        )
++        self.assertEqual(body["invites"][1]["role"], "viewer")
++        self.assertEqual(body["invites"][1]["invited_by"], "Ada")
++
++    def test_token_is_never_exposed(self):
++        row = self.invite()
++        _, body = call(self.app, "GET", INVITES, user_id=ADA)
++        self.assertNotIn(row["token"], str(body))
++
++    def test_revoked_invites_are_left_out(self):
++        row = self.invite()
++        invite.revoke(self.conn, TEAM, row["id"])
++        _, body = call(self.app, "GET", INVITES, user_id=ADA)
++        self.assertEqual(body["invites"], [])
++
++    def test_members_and_viewers_are_forbidden(self):
++        for user_id in (BO, CY):
++            status, _ = call(self.app, "GET", INVITES, user_id=user_id)
++            self.assertEqual(status, 403)
++
++    def test_requires_sign_in(self):
++        status, _ = call(self.app, "GET", INVITES)
++        self.assertEqual(status, 401)
++
++    def test_outsiders_cannot_tell_the_team_exists(self):
++        status, _ = call(self.app, "GET", INVITES, user_id=DEE)
++        self.assertEqual(status, 404)
++
++
++class RevokeInviteTest(InvitesApiCase):
++    def test_admin_revokes_an_invite(self):
++        row = self.invite()
++        status, _ = call(self.app, "DELETE", f"{INVITES}/{row['id']}", user_id=ADA)
++        self.assertEqual(status, 204)
++        self.assertEqual(invite.find(self.conn, TEAM, row["id"])["status"], "revoked")
++
++    def test_non_admin_is_forbidden(self):
++        row = self.invite()
++        status, _ = call(self.app, "DELETE", f"{INVITES}/{row['id']}", user_id=BO)
++        self.assertEqual(status, 403)
++        self.assertEqual(invite.find(self.conn, TEAM, row["id"])["status"], "pending")
++
++    def test_unknown_invite_is_not_found(self):
++        for invite_id in ("99", "abc"):
++            status, _ = call(self.app, "DELETE", f"{INVITES}/{invite_id}", user_id=ADA)
++            self.assertEqual(status, 404)
++
++    def test_invite_of_another_team_is_not_found(self):
++        self.conn.execute("INSERT INTO teams (id, name) VALUES (?, 'Globex')", (OTHER_TEAM,))
++        row = self.invite(team_id=OTHER_TEAM)
++        status, _ = call(self.app, "DELETE", f"{INVITES}/{row['id']}", user_id=ADA)
++        self.assertEqual(status, 404)
++
++    def test_revoking_twice_is_a_conflict(self):
++        row = self.invite()
++        call(self.app, "DELETE", f"{INVITES}/{row['id']}", user_id=ADA)
++        status, body = call(self.app, "DELETE", f"{INVITES}/{row['id']}", user_id=ADA)
++        self.assertEqual(status, 409)
++        self.assertIn("pending", body["error"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.55.0
+

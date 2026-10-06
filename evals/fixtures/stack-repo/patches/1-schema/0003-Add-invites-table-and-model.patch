@@ -1,0 +1,263 @@
+From 8597ea889541c9c8f33aadaa0ac411b20500c185 Mon Sep 17 00:00:00 2001
+From: Fixture <fixture@example.com>
+Date: Thu, 1 Oct 2026 15:25:00 -0300
+Subject: [PATCH 3/4] Add invites table and model
+
+An invite asks an email address to join a team with a role. It carries
+a token, an expiry and a status. A partial unique index allows one
+pending invite per address per team.
+
+email_queued_at is unused for now: the email sweep fills it in.
+---
+ app/models/invite.py       |  98 ++++++++++++++++++++++++++++++++++
+ migrations/005_invites.sql |  20 +++++++
+ tests/test_invite_model.py | 105 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 223 insertions(+)
+ create mode 100644 app/models/invite.py
+ create mode 100644 migrations/005_invites.sql
+ create mode 100644 tests/test_invite_model.py
+
+diff --git a/app/models/invite.py b/app/models/invite.py
+new file mode 100644
+index 0000000..897dad9
+--- /dev/null
++++ b/app/models/invite.py
+@@ -0,0 +1,98 @@
++"""Team invites: an email address asked to join a team with a role."""
++
++import secrets
++from datetime import datetime, timedelta, timezone
++
++from app.models.membership import ROLES
++
++STATUSES = ("pending", "accepted", "revoked", "expired")
++TTL_DAYS = 7
++
++_SELECT = """
++    SELECT i.id, i.team_id, i.email, i.role, i.token, i.status, i.invited_by,
++           i.expires_at, i.email_queued_at, i.created_at,
++           t.name AS team_name, u.name AS invited_by_name
++    FROM invites i
++    JOIN teams t ON t.id = i.team_id
++    LEFT JOIN users u ON u.id = i.invited_by
++"""
++
++
++class DuplicateInviteError(Exception):
++    """The address already has a pending invite to the team."""
++
++
++class NotPendingError(Exception):
++    """The invite was already accepted, revoked or expired."""
++
++
++def _now():
++    return datetime.now(timezone.utc)
++
++
++def _stamp(moment):
++    # Second precision, always UTC, so stored values compare correctly as text.
++    return moment.isoformat(timespec="seconds")
++
++
++def normalize_email(email):
++    return email.strip().lower()
++
++
++def list_for_team(conn, team_id, status=None):
++    """A team's invites, newest first, optionally only those with one status."""
++    sql, args = _SELECT + " WHERE i.team_id = ?", [team_id]
++    if status is not None:
++        sql += " AND i.status = ?"
++        args.append(status)
++    rows = conn.execute(sql + " ORDER BY i.id DESC", args)
++    return [dict(row) for row in rows]
++
++
++def find(conn, team_id, invite_id):
++    row = conn.execute(
++        _SELECT + " WHERE i.team_id = ? AND i.id = ?", (team_id, invite_id)
++    ).fetchone()
++    return dict(row) if row else None
++
++
++def find_pending_for_email(conn, team_id, email):
++    row = conn.execute(
++        _SELECT + " WHERE i.team_id = ? AND i.email = ? AND i.status = 'pending'",
++        (team_id, normalize_email(email)),
++    ).fetchone()
++    return dict(row) if row else None
++
++
++def create(conn, team_id, email, role, invited_by):
++    if role not in ROLES:
++        raise ValueError(f"Unknown role: {role}")
++    email = normalize_email(email)
++    if find_pending_for_email(conn, team_id, email) is not None:
++        raise DuplicateInviteError()
++    cursor = conn.execute(
++        "INSERT INTO invites (team_id, email, role, token, invited_by, expires_at)"
++        " VALUES (?, ?, ?, ?, ?, ?)",
++        (
++            team_id,
++            email,
++            role,
++            secrets.token_urlsafe(32),
++            invited_by,
++            _stamp(_now() + timedelta(days=TTL_DAYS)),
++        ),
++    )
++    conn.commit()
++    return find(conn, team_id, cursor.lastrowid)
++
++
++def revoke(conn, team_id, invite_id):
++    """Revoke a pending invite. Returns it, or ``None`` if the team has no such invite."""
++    current = find(conn, team_id, invite_id)
++    if current is None:
++        return None
++    if current["status"] != "pending":
++        raise NotPendingError()
++    conn.execute("UPDATE invites SET status = 'revoked' WHERE id = ?", (invite_id,))
++    conn.commit()
++    return find(conn, team_id, invite_id)
+diff --git a/migrations/005_invites.sql b/migrations/005_invites.sql
+new file mode 100644
+index 0000000..773f75d
+--- /dev/null
++++ b/migrations/005_invites.sql
+@@ -0,0 +1,20 @@
++CREATE TABLE invites (
++    id INTEGER PRIMARY KEY,
++    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
++    email TEXT NOT NULL,
++    role TEXT NOT NULL CHECK (role IN ('admin', 'member', 'viewer')),
++    token TEXT NOT NULL UNIQUE,
++    status TEXT NOT NULL DEFAULT 'pending'
++        CHECK (status IN ('pending', 'accepted', 'revoked', 'expired')),
++    invited_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
++    expires_at TEXT NOT NULL,
++    email_queued_at TEXT,
++    created_at TEXT NOT NULL DEFAULT (datetime('now'))
++);
++
++CREATE INDEX invites_team_status_idx ON invites (team_id, status);
++
++-- One pending invite per address per team. Revoked, expired and accepted
++-- invites stay in the table and do not block a new one.
++CREATE UNIQUE INDEX invites_pending_email_idx ON invites (team_id, email)
++    WHERE status = 'pending';
+diff --git a/tests/test_invite_model.py b/tests/test_invite_model.py
+new file mode 100644
+index 0000000..52ca05e
+--- /dev/null
++++ b/tests/test_invite_model.py
+@@ -0,0 +1,105 @@
++import unittest
++from datetime import datetime, timezone
++from unittest import mock
++
++from app.models import invite
++from tests.helpers import ADA, TEAM, make_env
++
++OTHER_TEAM = 2
++NOON = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
++
++
++class InviteModelCase(unittest.TestCase):
++    def setUp(self):
++        self.conn, _ = make_env()
++        self.conn.execute("INSERT INTO teams (id, name) VALUES (?, 'Globex')", (OTHER_TEAM,))
++        self.conn.commit()
++
++    def invite(self, email="new@example.com", role="member", team_id=TEAM):
++        return invite.create(self.conn, team_id, email, role, ADA)
++
++
++class CreateInviteTest(InviteModelCase):
++    def test_creates_a_pending_invite(self):
++        row = self.invite(" New@Example.com ", "viewer")
++        self.assertEqual(row["email"], "new@example.com")
++        self.assertEqual((row["role"], row["status"]), ("viewer", "pending"))
++        self.assertEqual((row["team_name"], row["invited_by_name"]), ("Acme", "Ada"))
++        self.assertIsNone(row["email_queued_at"])
++
++    def test_each_invite_gets_its_own_token(self):
++        first = self.invite("one@example.com")
++        second = self.invite("two@example.com")
++        self.assertGreaterEqual(len(first["token"]), 32)
++        self.assertNotEqual(first["token"], second["token"])
++
++    def test_expires_ttl_days_after_creation(self):
++        with mock.patch.object(invite, "_now", return_value=NOON):
++            row = self.invite()
++        self.assertEqual(invite.TTL_DAYS, 7)
++        self.assertEqual(row["expires_at"], "2026-10-08T12:00:00+00:00")
++
++    def test_unknown_role_is_rejected(self):
++        with self.assertRaises(ValueError):
++            self.invite(role="owner")
++
++    def test_second_pending_invite_for_an_address_is_refused(self):
++        self.invite("new@example.com")
++        with self.assertRaises(invite.DuplicateInviteError):
++            self.invite("NEW@example.com", "admin")
++
++    def test_same_address_can_be_invited_to_another_team(self):
++        self.invite("new@example.com")
++        row = self.invite("new@example.com", team_id=OTHER_TEAM)
++        self.assertEqual(row["team_name"], "Globex")
++
++
++class ListInvitesTest(InviteModelCase):
++    def test_lists_a_teams_invites_newest_first(self):
++        self.invite("one@example.com")
++        self.invite("two@example.com")
++        self.invite("elsewhere@example.com", team_id=OTHER_TEAM)
++        emails = [row["email"] for row in invite.list_for_team(self.conn, TEAM)]
++        self.assertEqual(emails, ["two@example.com", "one@example.com"])
++
++    def test_filters_by_status(self):
++        gone = self.invite("one@example.com")
++        self.invite("two@example.com")
++        invite.revoke(self.conn, TEAM, gone["id"])
++        pending = invite.list_for_team(self.conn, TEAM, status="pending")
++        self.assertEqual([row["email"] for row in pending], ["two@example.com"])
++        revoked = invite.list_for_team(self.conn, TEAM, status="revoked")
++        self.assertEqual([row["email"] for row in revoked], ["one@example.com"])
++
++
++class RevokeInviteTest(InviteModelCase):
++    def test_revokes_a_pending_invite(self):
++        row = self.invite()
++        revoked = invite.revoke(self.conn, TEAM, row["id"])
++        self.assertEqual(revoked["status"], "revoked")
++        self.assertIsNone(invite.find_pending_for_email(self.conn, TEAM, row["email"]))
++
++    def test_unknown_invite_is_none(self):
++        self.assertIsNone(invite.revoke(self.conn, TEAM, 99))
++
++    def test_invite_of_another_team_is_none(self):
++        row = self.invite(team_id=OTHER_TEAM)
++        self.assertIsNone(invite.revoke(self.conn, TEAM, row["id"]))
++        self.assertEqual(invite.find(self.conn, OTHER_TEAM, row["id"])["status"], "pending")
++
++    def test_revoking_twice_is_refused(self):
++        row = self.invite()
++        invite.revoke(self.conn, TEAM, row["id"])
++        with self.assertRaises(invite.NotPendingError):
++            invite.revoke(self.conn, TEAM, row["id"])
++
++    def test_address_can_be_invited_again_after_a_revoke(self):
++        row = self.invite()
++        invite.revoke(self.conn, TEAM, row["id"])
++        again = self.invite(row["email"])
++        self.assertEqual(again["status"], "pending")
++        self.assertNotEqual(again["id"], row["id"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.55.0
+

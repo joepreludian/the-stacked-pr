@@ -1,0 +1,151 @@
+From 6e34774583de470d6fb3d6646526d7db9ccbf0ee Mon Sep 17 00:00:00 2001
+From: Fixture <fixture@example.com>
+Date: Fri, 2 Oct 2026 14:45:00 -0300
+Subject: [PATCH 3/3] Add invite create endpoint with validation
+
+POST /api/teams/<team_id>/invites. A malformed address or an unknown
+role is a 422; an address that is already a member or already has a
+pending invite is a 409.
+
+The handler only stores the invite. It does not queue the email.
+---
+ app/handlers/invites.py   | 27 ++++++++++++++++-
+ tests/test_invites_api.py | 63 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 89 insertions(+), 1 deletion(-)
+
+diff --git a/app/handlers/invites.py b/app/handlers/invites.py
+index d39e06e..90edd49 100644
+--- a/app/handlers/invites.py
++++ b/app/handlers/invites.py
+@@ -4,9 +4,15 @@ Creating an invite only stores it. The email is queued later by the sweep in
+ ``app/mail``, so nothing here touches the mail queue.
+ """
+ 
++import re
++
+ from app.auth import require_team_role
+ from app.http import error, json_response, no_content
+-from app.models import invite
++from app.models import invite, membership
++
++# Deliberately loose: one @, no spaces, a dot in the domain. The real check is
++# whether the invite email arrives.
++EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+ 
+ 
+ def _public(row):
+@@ -22,6 +28,24 @@ def _public(row):
+     }
+ 
+ 
++@require_team_role("admin")
++def create_invite(request):
++    data = request.json()
++    email = invite.normalize_email(str(data.get("email") or ""))
++    role = data.get("role")
++    if not EMAIL_RE.match(email):
++        return error(422, "email must be a valid email address")
++    if role not in membership.ROLES:
++        return error(422, "role must be one of: " + ", ".join(membership.ROLES))
++    if membership.find_for_email(request.conn, request.team_id, email) is not None:
++        return error(409, "That person is already a member of this team")
++    try:
++        created = invite.create(request.conn, request.team_id, email, role, request.user["id"])
++    except invite.DuplicateInviteError:
++        return error(409, "That address already has a pending invite")
++    return json_response({"invite": _public(created)}, 201)
++
++
+ @require_team_role("admin")
+ def list_invites(request):
+     rows = invite.list_for_team(request.conn, request.team_id, status="pending")
+@@ -43,5 +67,6 @@ def revoke_invite(request):
+ 
+ 
+ def register(router):
++    router.add("POST", "/api/teams/<team_id>/invites", create_invite)
+     router.add("GET", "/api/teams/<team_id>/invites", list_invites)
+     router.add("DELETE", "/api/teams/<team_id>/invites/<invite_id>", revoke_invite)
+diff --git a/tests/test_invites_api.py b/tests/test_invites_api.py
+index 47ca47c..b3384ec 100644
+--- a/tests/test_invites_api.py
++++ b/tests/test_invites_api.py
+@@ -1,5 +1,6 @@
+ import unittest
+ 
++from app.mail import queue
+ from app.models import invite
+ from tests.helpers import ADA, BO, CY, DEE, TEAM, call, make_env
+ 
+@@ -15,6 +16,68 @@ class InvitesApiCase(unittest.TestCase):
+         return invite.create(self.conn, team_id, email, role, ADA)
+ 
+ 
++class CreateInviteTest(InvitesApiCase):
++    def post(self, body, user_id=ADA):
++        return call(self.app, "POST", INVITES, user_id=user_id, body=body)
++
++    def test_admin_invites_an_address(self):
++        status, body = self.post({"email": " New@Example.com ", "role": "viewer"})
++        self.assertEqual(status, 201)
++        created = body["invite"]
++        self.assertEqual((created["email"], created["role"]), ("new@example.com", "viewer"))
++        self.assertEqual((created["status"], created["invited_by"]), ("pending", "Ada"))
++        self.assertNotIn("token", created)
++        self.assertIsNotNone(invite.find(self.conn, TEAM, created["id"]))
++
++    def test_creating_an_invite_does_not_queue_mail(self):
++        _, body = self.post({"email": "new@example.com", "role": "member"})
++        self.assertEqual(queue.pending(self.conn), [])
++        self.assertIsNone(invite.find(self.conn, TEAM, body["invite"]["id"])["email_queued_at"])
++
++    def test_non_admin_is_forbidden(self):
++        status, _ = self.post({"email": "new@example.com", "role": "member"}, user_id=BO)
++        self.assertEqual(status, 403)
++        self.assertEqual(invite.list_for_team(self.conn, TEAM), [])
++
++    def test_bad_email_is_rejected(self):
++        for email in ("", "not-an-email", "a@b", "two words@example.com", "a@@b.com", 42, None):
++            status, body = self.post({"email": email, "role": "member"})
++            self.assertEqual(status, 422, email)
++            self.assertIn("email", body["error"])
++
++    def test_unknown_or_missing_role_is_rejected(self):
++        for payload in ({"email": "new@example.com", "role": "owner"}, {"email": "new@example.com"}):
++            status, body = self.post(payload)
++            self.assertEqual(status, 422)
++            self.assertIn("role must be one of", body["error"])
++
++    def test_existing_member_is_a_conflict(self):
++        status, body = self.post({"email": "BO@example.com", "role": "admin"})
++        self.assertEqual(status, 409)
++        self.assertIn("already a member", body["error"])
++        self.assertEqual(invite.list_for_team(self.conn, TEAM), [])
++
++    def test_user_outside_the_team_can_be_invited(self):
++        status, _ = self.post({"email": "dee@example.com", "role": "member"})
++        self.assertEqual(status, 201)
++
++    def test_duplicate_pending_invite_is_a_conflict(self):
++        self.post({"email": "new@example.com", "role": "member"})
++        status, body = self.post({"email": "New@example.com", "role": "viewer"})
++        self.assertEqual(status, 409)
++        self.assertIn("pending invite", body["error"])
++
++    def test_address_can_be_invited_again_after_a_revoke(self):
++        _, body = self.post({"email": "new@example.com", "role": "member"})
++        call(self.app, "DELETE", f"{INVITES}/{body['invite']['id']}", user_id=ADA)
++        status, _ = self.post({"email": "new@example.com", "role": "member"})
++        self.assertEqual(status, 201)
++
++    def test_invalid_json_is_a_bad_request(self):
++        status, _ = self.post("not json")
++        self.assertEqual(status, 400)
++
++
+ class ListInvitesTest(InvitesApiCase):
+     def test_admin_lists_pending_invites_newest_first(self):
+         self.invite("one@example.com", "viewer")
+-- 
+2.55.0
+

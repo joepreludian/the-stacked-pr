@@ -1,0 +1,109 @@
+From c3f6a7dfe1a8dcddcfb848b056c4993c73dae53c Mon Sep 17 00:00:00 2001
+From: Fixture <fixture@example.com>
+Date: Sat, 3 Oct 2026 09:35:00 -0300
+Subject: [PATCH 1/2] Add the invite email
+
+A template and the function that renders it onto the mail queue for one
+invite. The link points at /invites/accept, which arrives with the
+accept flow.
+---
+ app/mail/invite.py            | 18 ++++++++++++++++
+ app/mail/templates/invite.txt | 13 ++++++++++++
+ tests/test_invite_mail.py     | 40 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 71 insertions(+)
+ create mode 100644 app/mail/invite.py
+ create mode 100644 app/mail/templates/invite.txt
+ create mode 100644 tests/test_invite_mail.py
+
+diff --git a/app/mail/invite.py b/app/mail/invite.py
+new file mode 100644
+index 0000000..be10732
+--- /dev/null
++++ b/app/mail/invite.py
+@@ -0,0 +1,18 @@
++"""The team invite email."""
++
++from app.mail import queue
++from app.mail.templates import render
++from app.models.invite import TTL_DAYS
++
++
++def send(conn, invite_row, base_url):
++    """Put the email for one invite on the mail queue."""
++    subject, body = render(
++        "invite",
++        inviter=invite_row["invited_by_name"] or "A teammate",
++        team=invite_row["team_name"],
++        role=invite_row["role"],
++        link=f"{base_url}/invites/accept?token={invite_row['token']}",
++        days=TTL_DAYS,
++    )
++    return queue.enqueue(conn, invite_row["email"], subject, body)
+diff --git a/app/mail/templates/invite.txt b/app/mail/templates/invite.txt
+new file mode 100644
+index 0000000..451ed15
+--- /dev/null
++++ b/app/mail/templates/invite.txt
+@@ -0,0 +1,13 @@
++Subject: $inviter invited you to join $team on Teamdesk
++
++Hi,
++
++$inviter has invited you to join the $team team on Teamdesk with the $role
++role. Use this link to accept:
++
++$link
++
++The invite works for $days days. If you were not expecting it, you can ignore
++this email and nothing will happen.
++
++Teamdesk
+diff --git a/tests/test_invite_mail.py b/tests/test_invite_mail.py
+new file mode 100644
+index 0000000..5950a2e
+--- /dev/null
++++ b/tests/test_invite_mail.py
+@@ -0,0 +1,40 @@
++import unittest
++
++from app.mail import invite as invite_mail
++from app.mail import queue
++from app.models import invite
++from tests.helpers import ADA, DEE, TEAM, make_env
++
++BASE_URL = "https://teamdesk.test"
++
++
++class InviteMailCase(unittest.TestCase):
++    def setUp(self):
++        self.conn, _ = make_env()
++
++    def invite(self, email="new@example.com", role="member", invited_by=ADA):
++        return invite.create(self.conn, TEAM, email, role, invited_by)
++
++
++class InviteMessageTest(InviteMailCase):
++    def test_queues_a_message_for_the_invited_address(self):
++        row = self.invite(role="viewer")
++        invite_mail.send(self.conn, row, BASE_URL)
++        (message,) = queue.pending(self.conn)
++        self.assertEqual(message["to_email"], "new@example.com")
++        self.assertEqual(message["subject"], "Ada invited you to join Acme on Teamdesk")
++        self.assertIn(f"{BASE_URL}/invites/accept?token={row['token']}", message["body"])
++        self.assertIn("with the viewer", message["body"])
++        self.assertIn(f"{invite.TTL_DAYS} days", message["body"])
++
++    def test_inviter_who_has_since_been_deleted(self):
++        row = self.invite(invited_by=DEE)
++        self.conn.execute("DELETE FROM users WHERE id = ?", (DEE,))
++        self.conn.commit()
++        invite_mail.send(self.conn, invite.find(self.conn, TEAM, row["id"]), BASE_URL)
++        (message,) = queue.pending(self.conn)
++        self.assertEqual(message["subject"], "A teammate invited you to join Acme on Teamdesk")
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.55.0
+
